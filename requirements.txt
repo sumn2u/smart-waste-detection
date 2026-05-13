@@ -1,6 +1,3 @@
 torch
 torchvision
 Pillow
-transformers
-accelerate
-supervision

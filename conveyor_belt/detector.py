@@ -1,70 +1,85 @@
 import torch
-from PIL import Image
-from transformers import AutoImageProcessor, AutoConfig
-import supervision as sv
 import numpy as np
-from types import SimpleNamespace
+from PIL import Image
+from pathlib import Path
 
-# -------------------------------
-# 1. Load processor and config (for labels)
-# -------------------------------
-model_path = "../rtdetr-finetuned-final"
-processor = AutoImageProcessor.from_pretrained(model_path)
-config = AutoConfig.from_pretrained(model_path)
-id2label = config.id2label
+# 1. Setup Paths dynamically
+# This gets the directory where THIS script is saved
+BASE_DIR = Path(__file__).resolve().parent
 
-# -------------------------------
-# 2. Load traced TorchScript model
-# -------------------------------
-model = torch.jit.load("rtdetr_traced.pt")
-model.eval()
+# Define paths relative to the script location
+MODEL_PATH = BASE_DIR / "rtdetr_traced.pt"
+IMAGE_PATH = BASE_DIR.parent / "samples" / "plastic_2.jpg"
 
-# -------------------------------
-# 3. Load and preprocess image
-# -------------------------------
-image_path = "../samples/plastic_2.jpg"
+# 2. Configuration
+ID2LABEL = {0: 'cardboard', 1: 'glass', 2: 'metal', 3: 'paper', 4: 'plastic'}
+CONF_THRESHOLD = 0.5
 
-image = Image.open(image_path).convert("RGB")
-inputs = processor(images=image, return_tensors="pt")
+def load_lite_model(path):
+    if not path.exists():
+        raise FileNotFoundError(f"Model file not found at: {path}")
+    model = torch.jit.load(str(path), map_location='cpu')
+    model.eval()
+    return model
 
-# -------------------------------
-# 4. Run inference
-# -------------------------------
-with torch.no_grad():
-    logits, pred_boxes = model(inputs["pixel_values"])
+def simple_predict(model, img_path):
+    if not img_path.exists():
+        raise FileNotFoundError(f"Image file not found at: {img_path}")
 
-# Wrap outputs into an object that the processor expects
-outputs = SimpleNamespace(logits=logits, pred_boxes=pred_boxes)
+    # --- PREPROCESSING ---
+    img = Image.open(img_path).convert("RGB")
+    orig_w, orig_h = img.size
+    
+    img_resized = img.resize((640, 640))
+    img_np = np.array(img_resized).astype(np.float32) / 255.0
+    
+    # Standardization
+    # mean, std = np.array([0.485, 0.456, 0.406]), np.array([0.229, 0.224, 0.225])
+    # img_np = (img_np - mean) / std
+    
+    tensor = torch.from_numpy(img_np.transpose(2, 0, 1)).unsqueeze(0)
 
-# -------------------------------
-# 5. Post-process detections
-# -------------------------------
-target_sizes = torch.tensor([image.size[::-1]])  # (height, width)
-detections_dict = processor.post_process_object_detection(
-    outputs, threshold=0.5, target_sizes=target_sizes
-)[0]
+    # Match model precision (solves the Double vs Float error)
+    model_dtype = next(model.parameters()).dtype
+    tensor = tensor.to(model_dtype)
 
-detections = sv.Detections.from_transformers(detections_dict).with_nms(threshold=0.5, class_agnostic=False)
-# detections = detections.with_nms(threshold=0.5) 
+    # --- INFERENCE ---
+    with torch.no_grad():
+        logits, boxes = model(tensor)
 
-# -------------------------------
-# 6. PRINT ALL DETECTIONS
-# -------------------------------
-print(f"\nFound {len(detections)} object(s):\n")
-for i, (box, conf, cls) in enumerate(zip(detections.xyxy, detections.confidence, detections.class_id)):
-    label = id2label.get(cls.item(), f"class_{cls.item()}")
-    print(f"{i+1}. {label} (confidence: {conf:.3f})")
-    print(f"   Bounding box (x1,y1,x2,y2): {box.tolist()}\n")
+    # --- POST-PROCESSING ---
+    probs = logits.sigmoid()
+    scores, labels = torch.max(probs[0], dim=-1)
+    
+    keep = scores > CONF_THRESHOLD
+    scores, labels, boxes = scores[keep], labels[keep], boxes[0][keep]
 
-# -------------------------------
-# 7. Visualize (optional)
-# -------------------------------
-img_np = np.array(image)
-labels = [
-    f"{id2label.get(c.item(), str(c.item()))} {s:.2f}"
-    for c, s in zip(detections.class_id, detections.confidence)
-]
+    results = []
+    for i in range(len(scores)):
+        # Convert cxcywh (normalized) to xyxy (pixel coordinates)
+        cx, cy, nw, nh = boxes[i].tolist()
+        x1 = (cx - nw / 2) * orig_w
+        y1 = (cy - nh / 2) * orig_h
+        x2 = (cx + nw / 2) * orig_w
+        y2 = (cy + nh / 2) * orig_h
+        
+        results.append({
+            "label": ID2LABEL.get(labels[i].item(), "unknown"),
+            "score": scores[i].item(),
+            "box": [round(x, 2) for x in [x1, y1, x2, y2]]
+        })
+    return results
 
-annotated = sv.BoxAnnotator().annotate(img_np.copy(), detections)
-annotated = sv.LabelAnnotator().annotate(annotated, detections, labels)
-sv.plot_image(annotated, size=(12, 12))
+if __name__ == "__main__":
+    try:
+        detector = load_lite_model(MODEL_PATH)
+        detections = simple_predict(detector, IMAGE_PATH)
+        
+        print(f"\nScanning: {IMAGE_PATH.name}")
+        if not detections:
+            print("No objects found.")
+        for d in detections:
+            print(f"[{d['label']}] Confidence: {d['score']:.2%} | Box: {d['box']}")
+            
+    except Exception as e:
+        print(f"Status: Error - {e}")
