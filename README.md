@@ -16,10 +16,11 @@ Categories:
 ```
 ├── smart_bin/
 │   ├── classifier.py
+│   ├── camera_classification.py
 │   └── smart_bin.pth
 ├── conveyor_belt/
 │   ├── detector.py
-│   ├── rtdetr_final/
+│   ├── camera_detection.py
 │   └── rtdetr_traced.pt
 ├── requirements.txt
 └── README.md
@@ -53,8 +54,7 @@ pip install -r requirements.txt
 ```txt
 torch>=2.0.0
 torchvision>=0.15.0
-transformers>=4.30.0
-supervision>=0.18.0
+opencv-python>=4.13.0.90
 Pillow>=9.0.0
 numpy>=1.24.0
 ```
