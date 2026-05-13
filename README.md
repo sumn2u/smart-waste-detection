@@ -26,7 +26,6 @@ Categories:
 └── README.md
 
 ```
-> Model files are not included – you must train or obtain them separately.
 
 ---
 
