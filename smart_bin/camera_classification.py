@@ -1,61 +1,74 @@
-import torch
-import torchvision.models as models
-from torchvision import transforms
-from PIL import Image
-from pathlib import Path
 import cv2
-import time
 import numpy as np
+import onnxruntime as ort
+from pathlib import Path
+import time
 
 # --- SETUP ---
-# BASE_DIR points to the folder where this script is located
 BASE_DIR = Path(__file__).resolve().parent
-MODEL_PATH = BASE_DIR / "smart_bin.pth"
+# Make sure you export your PyTorch model to this ONNX path
+MODEL_PATH = BASE_DIR / "smart_bin.onnx"
 
-# Classes must match your training order (6 classes based on your model file)
+# Classes must match your training order
 CLASSES = ['cardboard', 'glass', 'metal', 'paper', 'plastic', 'trash']
 
-# 1. Load the Model
-def load_lite_model(path, num_classes=6):
-    print(f"Loading Classification Model from: {path}")
+
+# 1. Load the ONNX Session
+def load_onnx_model(path):
+    print(f"Loading ONNX Classification Model from: {path}")
     if not path.exists():
         raise FileNotFoundError(f"Model file not found at {path}")
-        
-    # Reconstruct the MobileNetV3 architecture
-    model = models.mobilenet_v3_small(weights=None)
-    in_features = model.classifier[-1].in_features
-    model.classifier[-1] = torch.nn.Linear(in_features, num_classes)
-    
-    # Load the trained weights
-    model.load_state_dict(torch.load(path, map_location='cpu'))
-    model.eval()
-    
-    # Use TorchScript (JIT) for optimized inference performance
-    return torch.jit.script(model)
 
-# 2. Define the Preprocessing Pipeline
-preprocess = transforms.Compose([
-    transforms.ToPILImage(), # Necessary for OpenCV BGR to Torchvision conversion
-    transforms.Resize((640, 640)),
-    transforms.ToTensor(),
-    transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
-])
+    # Initialize ONNX Runtime session
+    # (Defaults to CPU; will use GPU automatically if available and configured)
+    session = ort.InferenceSession(str(path), providers=["CPUExecutionProvider"])
+    return session
+
+
+# 2. NumPy-based Preprocessing Pipeline (Replaces torchvision.transforms)
+def preprocess_frame(frame_rgb):
+    # Resize to 640x640 (matching your PyTorch settings)
+    resized = cv2.resize(frame_rgb, (640, 640), interpolation=cv2.INTER_LINEAR)
+
+    # Convert to float32 and scale to [0, 1] (Equivalent to transforms.ToTensor())
+    img_data = resized.astype(np.float32) / 255.0
+
+    # Normalize (Equivalent to transforms.Normalize(mean=..., std=...))
+    mean = np.array([0.485, 0.456, 0.406], dtype=np.float32)
+    std = np.array([0.229, 0.224, 0.225], dtype=np.float32)
+    img_data = (img_data - mean) / std
+
+    # Change HWC layout (Height, Width, Channels) to CHW layout (Channels, Height, Width)
+    img_data = np.transpose(img_data, (2, 0, 1))
+
+    # Add batch dimension: (1, C, H, W)
+    img_data = np.expand_dims(img_data, axis=0)
+    return img_data
+
+
+# 3. Softmax implementation for NumPy
+def softmax(x):
+    e_x = np.exp(x - np.max(x, axis=1, keepdims=True))
+    return e_x / e_x.sum(axis=1, keepdims=True)
+
 
 def main():
     try:
-        # Initialize Model
-        model = load_lite_model(MODEL_PATH, num_classes=len(CLASSES))
-        model_dtype = next(model.parameters()).dtype
-        
-        # Initialize Camera (0 is built-in webcam)
+        # Initialize ONNX Session
+        session = load_onnx_model(MODEL_PATH)
+        input_name = session.get_inputs()[0].name
+
+        # Initialize Camera
         cap = cv2.VideoCapture(0)
         if not cap.isOpened():
-            print("Error: Could not open webcam. Check Privacy & Security settings.")
+            print(
+                "Error: Could not open webcam. Check Privacy & Security settings."
+            )
             return
 
-        print("\n--- CLASSIFICATION LIVE LOGS ---")
+        print("\n--- CLASSIFICATION LIVE LOGS (ONNX) ---")
         print("Click the video window and press 'q' to exit.\n")
-        
+
         prev_time = 0
         frame_count = 0
 
@@ -74,49 +87,64 @@ def main():
 
             # Preprocess the frame (OpenCV BGR -> RGB)
             frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-            input_tensor = preprocess(frame_rgb).unsqueeze(0).to(model_dtype)
+            input_tensor = preprocess_frame(frame_rgb)
 
-            # Run Model Inference
-            with torch.no_grad():
-                logits = model(input_tensor)
-                probs = torch.softmax(logits, dim=1)
-                conf, idx = torch.max(probs, 1)
-            
-            label = CLASSES[idx.item()]
-            score = conf.item()
+            # Run ONNX Inference
+            # outputs[0] contains the raw logits
+            outputs = session.run(None, {input_name: input_tensor})
+            logits = outputs[0]
 
-            # --- TERMINAL LOGGING (ROWS) ---
-            # Print a new row every 15 frames so the logs are readable
+            # Post-processing (Softmax and Max)
+            probs = softmax(logits)
+            idx = np.argmax(probs, axis=1)[0]
+            score = probs[0][idx]
+
+            label = CLASSES[idx]
+
+            # --- TERMINAL LOGGING ---
             if frame_count % 15 == 0:
-                print(f"[FPS: {fps:4.1f}] Top Prediction: {label:10} | Confidence: {score:.2%}")
+                print(
+                    f"[FPS: {fps:4.1f}] Top Prediction: {label:10} | Confidence: {score:.2%}"
+                )
 
             # --- VISUAL OVERLAY ---
-            # Draw the label and confidence on the video frame
             display_text = f"{label} ({score:.1%})"
-            cv2.putText(frame, display_text, (20, 80), cv2.FONT_HERSHEY_SIMPLEX, 
-                        1.2, (0, 255, 0), 3)
-            
-            # Draw FPS counter
-            cv2.putText(frame, f"FPS: {int(fps)}", (20, 40), cv2.FONT_HERSHEY_SIMPLEX, 
-                        0.7, (255, 0, 0), 2)
+            cv2.putText(
+                frame,
+                display_text,
+                (20, 80),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                1.2,
+                (0, 255, 0),
+                3,
+            )
+            cv2.putText(
+                frame,
+                f"FPS: {int(fps)}",
+                (20, 40),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.7,
+                (255, 0, 0),
+                2,
+            )
 
             # Show the frame
-            cv2.imshow('Smart Bin Classification Simulation', frame)
+            cv2.imshow("Smart Bin Classification Simulation", frame)
 
             # Exit logic
-            if cv2.waitKey(1) & 0xFF == ord('q'):
+            if cv2.waitKey(1) & 0xFF == ord("q"):
                 print("\nStopping Camera Feed...")
                 break
 
         # Release resources
         cap.release()
         cv2.destroyAllWindows()
-        # Ensure macOS window closes
         for i in range(5):
             cv2.waitKey(1)
-            
+
     except Exception as e:
         print(f"\nRuntime Error: {e}")
+
 
 if __name__ == "__main__":
     main()
